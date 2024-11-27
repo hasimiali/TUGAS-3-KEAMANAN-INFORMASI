@@ -1,99 +1,88 @@
 import socket
-from rsa_utils import generate_keypair, decrypt_rsa
-from des_constants import *
-from typing import List
+from des_cli import *
+from rsa import *
 
-# Generate RSA keypair
-public_key, private_key = generate_keypair(1024)
+def register_server_public_key(identifier, public_key):
+    pka_connection = socket.socket()
+    pka_connection.connect(("127.0.0.1", 7000))
+    e, n = public_key
+    pka_connection.send(f"REGISTER {identifier} {e} {n}".encode())
+    server_response = pka_connection.recv(1024).decode()
+    print(server_response)
+    pka_connection.close()
 
-print("Server Public Key:", public_key)
-print("Server Private Key:", private_key)
-
-def permute(block, table):
-    return [block[x - 1] for x in table]
-
-def xor(bits1, bits2):
-    return [b1 ^ b2 for b1, b2 in zip(bits1, bits2)]
-
-def left_rotate(bits, n):
-    return bits[n:] + bits[:n]
-
-def generate_keys(key):
-    key = permute(key, PC1)  # 64-bit to 56-bit key
-    left, right = key[:28], key[28:]
-    round_keys = []
-    
-    for shift in LEFT_SHIFTS:
-        left = left_rotate(left, shift)
-        right = left_rotate(right, shift)
-        round_key = permute(left + right, PC2)
-        round_keys.append(round_key)
-    
-    return round_keys
-
-def str_to_bin64(text: str) -> List[int]:
-    bin_text = ''.join(f'{ord(char):08b}' for char in text)
-    return [int(bit) for bit in bin_text.ljust(64, '0')[:64]] 
-
-def hex_key_to_bin64(hex_key: str) -> List[int]:
-    bin_key = bin(int(hex_key, 16))[2:].zfill(64)
-    return [int(bit) for bit in bin_key[:64]]  
-
-def feistel(right, subkey):
-    expanded = permute(right, E)
-    xored = xor(expanded, subkey)
-    substituted = []
-    for i in range(8):
-        row = (xored[i*6] << 1) | xored[i*6 + 5]
-        col = (xored[i*6 + 1] << 3) | (xored[i*6 + 2] << 2) | (xored[i*6 + 3] << 1) | xored[i*6 + 4]
-        substituted.extend(bin(S_BOXES[i][row][col])[2:].zfill(4))
-    return permute([int(bit) for bit in substituted], P)
-
-def des_encrypt_decrypt(block, keys, decrypt=False):
-    block = permute(block, IP)
-    left, right = block[:32], block[32:]
-    for round_key in (reversed(keys) if decrypt else keys):
-        temp_right = xor(left, feistel(right, round_key))
-        left, right = right, temp_right
-    return permute(right + left, IP_INV)
-
+def retrieve_public_key(identifier):
+    pka_connection = socket.socket()
+    pka_connection.connect(("127.0.0.1", 7000))
+    pka_connection.send(f"GET {identifier}".encode())
+    server_response = pka_connection.recv(1024).decode()
+    pka_connection.close()
+    if server_response == "Public Key Not Found":
+        raise Exception("Public Key Not Found in PKA")
+    e, n = map(int, server_response.split())
+    return (e, n)
 
 def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(("localhost", 12345))
-    server_socket.listen(1)
-    print("Server is listening on port 12345...")
+    host = socket.gethostname()
+    port = 5000
+    encryption_function = encryption_large_text
+    decryption_function = decryption_large_text
+    generate_key = generate_random_key
+
+    # Membuat pasangan kunci RSA
+    public_key, private_key = generate_rsa_keys()
+    print("Server RSA Public Key:", public_key)
+
+    # Mendaftarkan kunci publik server ke PKA
+    register_server_public_key("SERVER", public_key)
+
+    server_socket = socket.socket()
+    server_socket.bind((host, port))
+    server_socket.listen(2)
+    conn, address = server_socket.accept()
+    print("Koneksi dari:", address)
+
+    # Mengambil kunci publik klien dari PKA
+    client_public_key = retrieve_public_key("CLIENT")
+    print("Client Public Key:", client_public_key)
+    print("\n")
 
     while True:
-        client_socket, addr = server_socket.accept()
-        print("Connected by", addr)
+        # Langkah 1: Menerima kunci DES yang terenkripsi dan pesan dari klien
+        incoming_data = conn.recv(1024).decode()
+        if not incoming_data:
+            break
+        encrypted_key, encrypted_message = incoming_data.split('|')
 
-        # Send public key (n) to the client
-        e, n = public_key
-        client_socket.send(f"{e},{n}".encode())
-        print("Sent public key to client:", public_key)
+        # Mendekripsi kunci DES untuk pesan
+        des_key = rsa_decrypt(private_key, eval(encrypted_key))
+        print("Kunci DES yang didekripsi untuk pesan:", des_key)
 
-        # Receive encrypted DES key
-        encrypted_key = int(client_socket.recv(256).decode())
-        des_key = decrypt_rsa(private_key, encrypted_key)
-        des_key_hex = f"{des_key:016x}"  # Convert to hex string
-        print("Decrypted DES Key:", des_key_hex)
+        # Mendekripsi pesan yang sesungguhnya menggunakan kunci DES yang didekripsi
+        decrypted_message = decryption_function(encrypted_message, des_key)
+        print("Pesan Klien yang Terenkripsi:", encrypted_message)
+        print("Pesan Klien yang Didekripsi:", decrypted_message)
+        print("\n")
 
-        # Receive plaintext for encryption
-        data = client_socket.recv(1024).decode()
-        print("Received plaintext from client:", data)
+        # Langkah 2: Membuat kunci DES baru untuk respons server
+        response_des_key = generate_key()
+        print("Kunci DES yang Dihasilkan untuk Respons:", response_des_key)
 
-        binary_plaintext = str_to_bin64(data)
-        binary_key = hex_key_to_bin64(des_key_hex)
-        round_keys = generate_keys(binary_key)
-        encrypted_bin = des_encrypt_decrypt(binary_plaintext, round_keys, decrypt=False)
-        encrypted_text = ''.join(map(str, encrypted_bin))
+        # Mengenkripsi kunci DES baru dengan kunci publik klien
+        encrypted_response_key = rsa_encrypt(client_public_key, response_des_key)
 
-        client_socket.send(encrypted_text.encode())
-        print("Sent encrypted text to client:", encrypted_text)
+        # Meminta respons dari server dan mengenkripsi menggunakan kunci DES baru
+        server_response = input("Respons Server: ")
+        if server_response.lower().strip() == "bye":
+            break
+        encrypted_server_response = encryption_function(server_response, response_des_key)
 
-        client_socket.close()
+        # Mengirim kunci DES yang terenkripsi dan respons ke klien
+        conn.send(f"{encrypted_response_key}|{encrypted_server_response}".encode())
+        print("Respons yang Terenkripsi:", encrypted_server_response)
+        print("\n")
 
+    conn.close()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     start_server()
